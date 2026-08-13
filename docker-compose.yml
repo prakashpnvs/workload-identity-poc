@@ -1,0 +1,26 @@
+services:
+  receiver:
+    build:
+      context: .
+      dockerfile: receiver/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      JWT_SECRET: demo-secret
+      EXPECTED_CALLER_WORKLOAD_ID: workload-caller-01
+      EXPECTED_ISSUER: workload-identity-poc
+      RECEIVER_AUDIENCE: receiver-service
+
+  caller:
+    build:
+      context: .
+      dockerfile: caller/Dockerfile
+    depends_on:
+      - receiver
+    ports:
+      - "8001:8001"
+    environment:
+      JWT_SECRET: demo-secret
+      CALLER_WORKLOAD_ID: workload-caller-01
+      EXPECTED_ISSUER: workload-identity-poc
+      RECEIVER_URL: http://receiver:8000/protected

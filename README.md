@@ -120,6 +120,44 @@ The proof of concept is successful if it demonstrates:
 - Trust decisions and audit records are logged centrally
 - The system continues operating during and after the compromise scenario
 
+## Phase 1 Implementation Status
+
+This repository now includes the Phase 1 baseline workload-identity proof of concept using Python, FastAPI, Docker Compose, and short-lived signed JWTs.
+
+- `caller` sends a JWT to the protected receiver endpoint
+- `receiver` verifies signature, expiration, issuer, audience, and expected caller workload identity before allowing access
+- Every authorization decision emits a structured audit log with the caller identity, decision, and reason
+- The demonstration includes a valid request and a denied expired-token request
+- Runtime compromise detection, dynamic revocation, and recovery are intentionally not implemented in this phase
+
+## Run Instructions
+
+1. Create a virtual environment and install dependencies:
+   ```bash
+   cd workload-identity-poc
+   python3 -m venv .venv
+   . .venv/bin/activate
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
+2. Run the services locally without Docker:
+   ```bash
+   uvicorn receiver.app.main:app --host 0.0.0.0 --port 8000
+   uvicorn caller.app.main:app --host 0.0.0.0 --port 8001
+   ```
+3. Trigger the demonstration flows:
+   ```bash
+   curl http://localhost:8001/demo-valid
+   curl http://localhost:8001/demo-invalid
+   ```
+4. Or run everything with Docker Compose:
+   ```bash
+   docker compose up --build
+   curl http://localhost:8001/demo-valid
+   curl http://localhost:8001/demo-invalid
+   ```
+5. Inspect the JSON audit logs emitted by the receiver service in the terminal output.
+
 ## Next Steps
 
 1. Define concrete runtime integrity signals and detection mechanisms
@@ -131,6 +169,6 @@ The proof of concept is successful if it demonstrates:
 
 ---
 
-**Document Status:** Architecture Proposal  
-**Version:** 1.0  
+**Document Status:** Architecture Proposal + Phase 1 Implementation  
+**Version:** 1.1  
 **Date:** 2026

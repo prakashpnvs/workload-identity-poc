@@ -1,0 +1,22 @@
+# VCS
+.git
+.gitignore
+
+# Python virtual envs and caches
+.venv
+venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Local config
+.env
+.env.*
+
+# Editor / OS
+.vscode
+.DS_Store
+
+# Logs
+*.log
