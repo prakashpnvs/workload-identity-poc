@@ -120,99 +120,83 @@ The proof of concept is successful if it demonstrates:
 - Trust decisions and audit records are logged centrally
 - The system continues operating during and after the compromise scenario
 
-## Phase 2 Runtime Posture Trust Rule
+## Phase 1 Implementation (clarified)
 
-This repository now implements the Phase 2 trust rule for the existing proof of concept.
+This repository contains a Phase 1 baseline implementation of the workload-identity proof of concept. The implementation is intentionally small and portable: two FastAPI services (caller and receiver), short-lived signed JWTs for identity, and a simple runtime posture toggle used to demonstrate how runtime integrity affects access decisions.
 
-Trust is granted only when both conditions are true:
-- the caller workload identity is valid, and
-- the caller runtime posture is `healthy`
+Key points:
+- Authorization requires both a valid workload identity (signed JWT) and a healthy runtime posture.
+- Runtime posture is simulated for demonstration with explicit endpoints; no real attacks or detection systems are included.
+- All authorization decisions emit structured JSON audit records with decision reasoning.
 
-Access is denied when the workload identity remains valid but the runtime posture is `compromised`.
+### Runtime posture endpoints (demo-only)
+- GET  /runtime-posture — show current posture (`healthy` or `compromised`)
+- POST /runtime-posture/compromise — mark posture as `compromised`
+- POST /runtime-posture/recover — mark posture as `healthy`
 
-### Runtime posture model
-- Default caller posture: `healthy`
-- Explicit safe simulation: `POST /runtime-posture/compromise` changes the posture to `compromised`
-- Explicit safe recovery: `POST /runtime-posture/recover` changes the posture back to `healthy`
-- No real exploit or evasion behavior is used; this is a local, minimal demonstration only
+When posture is `compromised`, requests with otherwise valid identity receive 403 Forbidden and a runtime-integrity denial in the audit log.
 
-### Audit semantics
-- Identity failure events are tagged as identity verification failures
-- Runtime-integrity failures are tagged separately as runtime integrity compromised
-- Recovery is explicit and recorded in logs as a change back to healthy posture
-
-## Repeatable Demonstration
-
-1. Valid identity + healthy posture: allowed
-2. Same valid identity after compromise: denied for runtime integrity
-3. Recovery to healthy posture: access restored only through explicit recovery
-
-## Run Instructions
-
-1. Create a virtual environment and install dependencies:
+### Running locally (recommended)
+1. Create and activate a virtual environment (macOS/Linux):
    ```bash
-   cd workload-identity-poc
    python3 -m venv .venv
    . .venv/bin/activate
    python -m pip install --upgrade pip
    python -m pip install -r requirements.txt
    ```
-2. Run the receiver and caller services locally:
+
+   Notes:
+   - On Apple Silicon (arm64) macs, some binary wheels (e.g., pydantic_core) require matching interpreter architecture. If you see an ImportError referencing incompatible architecture, start servers using the same architecture as the wheel, e.g. `arch -arm64 .venv/bin/python -m uvicorn ...`.
+
+2. Start services for local testing (each command runs in its own terminal):
    ```bash
-   uvicorn receiver.app.main:app --host 0.0.0.0 --port 8000
-   uvicorn caller.app.main:app --host 0.0.0.0 --port 8001
+   .venv/bin/python -m uvicorn receiver.app.main:app --host 0.0.0.0 --port 8000
+   .venv/bin/python -m uvicorn caller.app.main:app   --host 0.0.0.0 --port 8001
    ```
-3. Confirm the valid and expired-token Phase 1 demos still work:
-   ```bash
-   curl http://localhost:8001/demo-valid
-   curl http://localhost:8001/demo-invalid
-   ```
-4. Demonstrate Phase 2 runtime compromise behavior:
-   ```bash
-   curl http://localhost:8001/runtime-posture
-   curl -X POST http://localhost:8001/runtime-posture/compromise
-   curl http://localhost:8001/demo-valid
-   ```
-   Expected result: the valid identity is denied with a 403 and reason `runtime integrity compromised`.
-5. Recover the workload posture explicitly and confirm access is restored:
-   ```bash
-   curl -X POST http://localhost:8001/runtime-posture/recover
-   curl http://localhost:8001/demo-valid
-   ```
-   Expected result: access is allowed again only after the explicit recovery action.
-6. Or run everything with Docker Compose:
+
+3. Run the demos:
+   - Valid request: `curl http://localhost:8001/demo-valid`
+   - Expired/invalid token: `curl http://localhost:8001/demo-invalid`
+   - Check posture: `curl http://localhost:8001/runtime-posture`
+   - Simulate compromise: `curl -X POST http://localhost:8001/runtime-posture/compromise`
+   - Recover: `curl -X POST http://localhost:8001/runtime-posture/recover`
+
+### Running with Docker Compose
+1. Install Docker Desktop (macOS/Windows) or Docker Engine (Linux).
+2. From the repo root:
    ```bash
    docker compose up --build
-   curl http://localhost:8001/demo-valid
-   curl http://localhost:8001/demo-invalid
-   curl -X POST http://localhost:8001/runtime-posture/compromise
-   curl http://localhost:8001/demo-valid
-   curl -X POST http://localhost:8001/runtime-posture/recover
-   curl http://localhost:8001/demo-valid
    ```
-7. Inspect the receiver terminal logs for JSON audit records showing `allow` and `deny` decisions with either identity-failure or runtime-integrity-failure reasons.
+3. The same demo endpoints are exposed on the caller service port (8001). Use `docker compose logs -f` to follow audit output.
 
-## Expected Evidence
+### Tests
+- Unit/integration tests are provided under `tests/` and can be executed with the virtualenv active:
+  ```bash
+  python -m pytest -q
+  ```
+- CI should run the same command and ensure architecture/wheel compatibility in runner images.
 
-A healthy request should produce a log entry resembling:
+### Troubleshooting
+- ImportError for `pydantic_core` complaining about incompatible architecture: recreate the venv on the target machine or run the Python binary under the same architecture as the wheel (macOS `arch` helper), or rebuild native wheels from source on that host.
+- If ports 8000/8001 are in use, stop the conflicting processes or change ports in the `uvicorn` commands and `docker-compose.yml`.
+
+### Expected audit evidence
+Healthy request example:
 ```json
 {"event":"authorization_decision","decision":"allow","reason":"valid workload identity and healthy runtime posture","caller_identity":"workload-caller-01","runtime_posture":"healthy"}
 ```
-
-A compromised request should produce a deny event resembling:
+Compromised request example:
 ```json
 {"event":"authorization_decision","decision":"deny","reason":"runtime integrity compromised","caller_identity":"workload-caller-01","runtime_posture":"compromised"}
 ```
 
-## Next Steps
-
-1. Add a separate policy store or signed posture attestation signal
-2. Introduce explicit trust state transitions and time-based evaluation windows
-3. Extend audit logging to centralize decisions for review and compliance
-4. Evaluate how this minimal model maps to real workload identity and attestation systems
+### Next steps (suggested)
+- Replace the posture toggle with signed remote attestations or a policy engine
+- Add time- and signal-based revocation windows and recovery proofs
+- Centralize audit logs and add tamper-evidence for compliance
 
 ---
 
-**Document Status:** Architecture Proposal + Phase 2 Runtime Posture Control  
-**Version:** 1.2  
+**Document Status:** Architecture Proposal + Phase 1 Implementation
+**Version:** 1.3
 **Date:** 2026
