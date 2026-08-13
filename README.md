@@ -1,202 +1,403 @@
 # Workload Identity Proof of Concept
 
-## Objective
+A demonstration that service-to-service trust can dynamically respond to runtime integrity changes, not just initial authentication.
 
-Develop and demonstrate a runtime-aware workload identity system that continuously evaluates trust across multiple pillars beyond initial authentication. This proof of concept validates that identity and access decisions can be dynamically adjusted when a service's runtime integrity is compromised, closing the gap between initial authentication trust and ongoing operational trust.
+## Problem & Objective
 
-## Scope
+### The Problem
 
-This prototype consists of two services:
+Existing workload-identity solutions (mTLS, OIDC, bearer tokens, cloud-native IAM) successfully establish a workload's identity and execution context at startup. Once authenticated, they grant access for the lifetime of the credential—typically until expiration or manual revocation.
 
-1. **Service A (Consumer)** — Requires authenticated access to protected resources
-2. **Service B (Provider)** — Grants or denies access based on continuous trust evaluation
+However, they provide no mechanism to detect and respond to runtime integrity degradation *after* authentication succeeds. A compromised workload may:
+- Experience code injection or memory corruption
+- Load malicious libraries
+- Have secrets exfiltrated
+- Execute unauthorized operations under its legitimate identity
 
-The scope includes:
+**Today, identity systems answer "who is calling?", not "what state is the caller in?"**
 
-- Establishing baseline authentication and trust between services
-- Simulating a runtime compromise in Service A
-- Detecting the compromise through observable signals
-- Dynamically revoking or restricting Service A's access
-- Recording auditable decisions for compliance and forensics
+### The Objective
 
-**Out of Scope:**
+This proof of concept validates a multi-pillar trust model where authorization depends not only on cryptographic identity, but also on continuous runtime-integrity evaluation. The system demonstrates that:
+- Identity and runtime-integrity decisions are independent and auditable
+- Access can be dynamically denied when integrity is compromised
+- Recovery is explicit and requires re-evaluation
 
-- Production-grade implementations or performance optimization
-- Kubernetes, container orchestration, or infrastructure-as-code
-- Complete application logic, business workflows, or feature development
-- Configuration management systems or dynamic policy engines
-- Comprehensive monitoring, logging, or alerting infrastructure
-- Multi-environment deployment strategies
+## Trust Model: Five Pillars
 
-## Problem Statement
+A trust decision is affirmative only if **all five pillars remain satisfactory**. Degradation in any pillar triggers re-evaluation and may result in access denial.
 
-Existing workload-identity solutions (mTLS, OIDC, bearer tokens, cloud-native IAM) successfully establish the identity and execution context of a workload at startup. However, they provide no mechanism to detect when that workload's *runtime integrity* has been compromised after authentication succeeds.
+| Pillar | Description | Signal | Status in This POC |
+|--------|-------------|--------|-------------------|
+| **Software Integrity** | Binaries, libraries, and dependencies match expected cryptographic signatures; no unauthorized code modifications | SBOM attestation, code signing verification | Not implemented (out of scope) |
+| **Execution Integrity** | Process runs with expected permissions, parent process, and runtime environment; no privilege escalation or container escape | UID, GID, parent PID, capabilities, seccomp status | Not implemented (out of scope) |
+| **Runtime Integrity** | Continuous observation of memory, CPU, I/O, and network behavior; detection of anomalous operations and policy violations | Behavioral anomalies, security event triggers, system call policy violations | **Simulated locally** — explicit compromise/recovery endpoints; no real monitoring |
+| **Identity and Access** | Caller's cryptographic identity (token, cert, key); confirmation that caller is authorized to perform the operation | JWT signature verification, subject/audience/issuer validation, ACL | **Implemented** — signed JWT with subject/audience/issuer checks |
+| **Operational Trust** | Audit trail of trust decisions, access grants, and denials; compliance with organizational policy | Tamper-evident decision logs with reasoning | **Implemented** — JSON audit records in service logs |
 
-A service may begin execution in a trusted state but later:
-- Experience memory corruption or code injection
-- Load malicious libraries or dependencies
-- Have its environment variables or secrets exfiltrated
-- Execute unauthorized operations under the guise of legitimate identity
+## Architecture
 
-Today's identity systems grant access based on *who* is calling, not *what state* the caller is in. Once authenticated, a compromised workload retains full access until its credentials expire or are explicitly revoked—a typically manual process.
+### Logical View
 
-This proof of concept evaluates whether runtime integrity signals can inform dynamic trust decisions, reducing the exposure window and improving the security posture of service-to-service communication.
+```mermaid
+graph LR
+    Caller["Caller Service<br/>(workload-caller-01)"]
+    Receiver["Receiver Service<br/>(Protected Resource)"]
+    Posture["Runtime Posture<br/>Component<br/>(healthy/compromised)"]
+    
+    Caller -->|1. Create JWT<br/>2. POST /protected<br/>+ Authorization header| Receiver
+    Receiver -->|3. Fetch Runtime Posture| Posture
+    Posture -->|4. Report posture| Receiver
+    Receiver -->|5. Emit audit decision| Receiver
+    Receiver -->|6. Return 200 or 403| Caller
+    
+    style Caller fill:#e1f5ff
+    style Receiver fill:#fff3e0
+    style Posture fill:#f3e5f5
+```
 
-## Trust Model
+### Process View: Authorization Flow
 
-Trust is evaluated across five independent pillars:
+The receiver enforces a four-step trust decision on every request:
 
-### 1. Software Integrity
-- Verification that binaries, libraries, and dependencies match expected cryptographic signatures
-- Detection of unauthorized code modifications or injected libraries
-- **Signal:** Attestation from software bill of materials (SBOM) or code signing verification
+1. **Parse Bearer Token** → Extract JWT from Authorization header
+2. **Verify Identity** → Validate JWT signature, issuer, audience, subject (HS256 HMAC)
+3. **Fetch Runtime Posture** → Query caller's runtime-posture endpoint
+4. **Emit Decision** → Log allow or deny with reason (identity failure or runtime-integrity failure)
 
-### 2. Execution Integrity
-- Confirmation that the process is running with the expected permissions, parent process, and runtime environment
-- Detection of privilege escalation, unexpected process spawning, or container escape attempts
-- **Signal:** Process metadata (UID, GID, parent PID, seccomp status, capabilities)
+```mermaid
+sequenceDiagram
+    participant Caller as Caller Service
+    participant Receiver as Receiver Service
+    participant AuditLog as Audit Log
+    
+    Note over Caller,Receiver: Healthy Request (Valid Token + Healthy Posture)
+    Caller->>Receiver: POST /protected<br/>Authorization: Bearer {JWT}
+    
+    activate Receiver
+    Note over Receiver: Parse JWT token
+    Note over Receiver: Verify signature, issuer, audience, subject
+    Receiver->>Caller: GET /runtime-posture
+    activate Caller
+    Caller-->>Receiver: {"runtime_posture": "healthy"}
+    deactivate Caller
+    
+    Note over Receiver: Decision: valid identity + healthy posture
+    Receiver->>AuditLog: {"event":"authorization_decision",<br/>"decision":"allow",<br/>"reason":"valid workload identity and healthy runtime posture"}
+    Receiver-->>Caller: 200 OK<br/>{"message": "Protected resource accessed"}
+    deactivate Receiver
+```
 
-### 3. Runtime Integrity
-- Continuous observation of memory, CPU, I/O, and network behavior at runtime
-- Detection of anomalous operations, unauthorized system calls, or unexpected resource access
-- **Signal:** Behavioral anomalies, policy violations, or security event triggers
+```mermaid
+sequenceDiagram
+    participant Caller as Caller Service
+    participant Receiver as Receiver Service
+    participant AuditLog as Audit Log
+    
+    Note over Caller,Receiver: Compromised Request (Valid Token + Compromised Posture)
+    Caller->>Receiver: POST /protected<br/>Authorization: Bearer {JWT}
+    
+    activate Receiver
+    Note over Receiver: Parse JWT token
+    Note over Receiver: Verify signature, issuer, audience, subject ✓
+    Receiver->>Caller: GET /runtime-posture
+    activate Caller
+    Caller-->>Receiver: {"runtime_posture": "compromised"}
+    deactivate Caller
+    
+    Note over Receiver: Decision: valid identity but posture != healthy
+    Receiver->>AuditLog: {"event":"authorization_decision",<br/>"decision":"deny",<br/>"reason":"runtime integrity compromised"}
+    Receiver-->>Caller: 403 Forbidden<br/>{"detail": "Access denied: runtime integrity compromised"}
+    deactivate Receiver
+```
 
-### 4. Identity and Access
-- Verification of the caller's cryptographic identity (certificate, token, or key)
-- Confirmation that the caller is authorized to perform the requested operation
-- **Signal:** Valid credentials and matching access control list (ACL)
+### Runtime Posture State Diagram
 
-### 5. Operational Trust
-- Audit trail of trust decisions, access grants, and denials
-- Compliance with organizational policy and regulatory requirements
-- **Signal:** Tamper-evident logs and decision rationale
+```mermaid
+stateDiagram-v2
+    [*] --> Healthy
+    
+    Healthy --> Compromised: POST /runtime-posture/compromise<br/>(simulated fault)
+    Compromised --> Healthy: POST /runtime-posture/recover<br/>(explicit remediation)
+    Compromised --> Compromised: Request while compromised<br/>(access denied, 403)
+    Healthy --> Healthy: Request while healthy<br/>(access allowed, 200)
+```
 
-A trust decision is affirmative only if *all five pillars remain satisfactory*. Degradation in any pillar triggers a re-evaluation and may result in access denial or revocation.
+### Development View
 
-## Proposed Demonstration
+```
+workload-identity-poc/
+├── README.md                 # This document
+├── requirements.txt          # Python dependencies (FastAPI, PyJWT, httpx, pytest)
+├── docker-compose.yml        # Orchestration for local testing
+│
+├── caller/
+│   └── app/
+│       └── main.py           # Workload-caller-01: issues JWTs, simulates posture changes
+│
+├── receiver/
+│   └── app/
+│       └── main.py           # Protected resource: validates JWT + runtime posture
+│
+└── tests/
+    └── test_auth_flow.py     # Integration tests (valid token, expired token, compromise, recovery)
+```
 
-### Phase 1: Baseline Trust
-1. Service A authenticates to Service B using standard workload identity (e.g., mTLS or signed JWT)
-2. Service B verifies all five trust pillars and grants access
-3. Service A makes repeated, authorized requests; Service B honors them
+**Key Responsibilities:**
 
-### Phase 2: Simulated Runtime Compromise
-1. A controlled fault or injection occurs in Service A's runtime (e.g., unauthorized system call, memory corruption, unexpected process spawn)
-2. Runtime integrity monitoring detects the anomaly
-3. The compromise is recorded as a runtime integrity violation
+- **caller/app/main.py** — JWT token issuer; manages runtime posture state (healthy/compromised/recovery)
+- **receiver/app/main.py** — Access control enforcement; fetches caller posture; emits audit decisions
+- **tests/test_auth_flow.py** — End-to-end validation of all four trust flows
 
-### Phase 3: Dynamic Trust Response
-1. Service B is notified of or observes the runtime integrity violation
-2. Service B re-evaluates the five pillars and downgrades trust
-3. Subsequent requests from Service A are denied or restricted
-4. An auditable decision record is logged, including:
-   - Timestamp of compromise detection
-   - Identity of the compromised service
-   - Pillar(s) that failed
-   - Trust decision (grant, restrict, revoke)
-   - Justification and evidence
+### Deployment View
 
-### Phase 4: Recovery and Audit
-1. Service A is restarted or remediated
-2. Trust is re-established through the five-pillar evaluation
-3. Audit logs demonstrate the complete lifecycle: trust → compromise → revocation → recovery
+```mermaid
+graph TB
+    subgraph Local["Local Environment"]
+        direction LR
+        CallerApp["Caller Service<br/>:8001"]
+        ReceiverApp["Receiver Service<br/>:8000"]
+        CallerApp -->|HTTP| ReceiverApp
+    end
+    
+    subgraph Docker["Docker Compose"]
+        direction LR
+        CallerDocker["caller service<br/>port 8001"]
+        ReceiverDocker["receiver service<br/>port 8000"]
+        CallerDocker -->|HTTP| ReceiverDocker
+    end
+    
+    style Local fill:#e8f5e9
+    style Docker fill:#e3f2fd
+```
 
-## Success Criteria
+## Scenarios
 
-The proof of concept is successful if it demonstrates:
+### Scenario 1: Baseline Trust (Phase 1)
 
-1. **Baseline Authentication Works** — Service A successfully authenticates and accesses Service B without runtime compromise
-2. **Compromise Detection** — A simulated runtime integrity violation is detected and surfaced to the access control layer
-3. **Dynamic Denial** — Service B denies subsequent requests from Service A after detecting the compromise
-4. **Audit Trail** — Access decisions are recorded with sufficient detail to reconstruct what happened, why, and when
-5. **Pillar Isolation** — Degradation in one pillar (runtime integrity) does not trigger false positives in others; other pillars remain verifiable and independent
-6. **Recovery Path** — After remediation, Service A can re-establish trust and regain access through normal authentication flow
+**Setup:** Both services running; runtime posture is `healthy`.
 
-## Architecture Overview
+**Flow:**
+1. Caller issues a JWT signed with the shared secret
+2. Caller sends JWT in Authorization header to Receiver
+3. Receiver validates JWT signature, issuer, audience, subject
+4. Receiver fetches caller's runtime posture → `healthy`
+5. Receiver grants access (200) and logs allow decision
 
-- Service A initiates requests to Service B
-- Service B enforces trust evaluation on each request
-- A runtime integrity monitor (or injected fault) signals when Service A enters a compromised state
-- Trust decisions and audit records are logged centrally
-- The system continues operating during and after the compromise scenario
+**Expected Evidence:**
+```json
+{"event":"authorization_decision","decision":"allow","reason":"valid workload identity and healthy runtime posture","caller_identity":"workload-caller-01","runtime_posture":"healthy"}
+```
 
-## Phase 1 Implementation (clarified)
+### Scenario 2: Runtime Compromise & Denial (Phase 2)
 
-This repository contains a Phase 1 baseline implementation of the workload-identity proof of concept. The implementation is intentionally small and portable: two FastAPI services (caller and receiver), short-lived signed JWTs for identity, and a simple runtime posture toggle used to demonstrate how runtime integrity affects access decisions.
+**Setup:** Services running; caller posture is changed to `compromised`.
 
-Key points:
-- Authorization requires both a valid workload identity (signed JWT) and a healthy runtime posture.
-- Runtime posture is simulated for demonstration with explicit endpoints; no real attacks or detection systems are included.
-- All authorization decisions emit structured JSON audit records with decision reasoning.
+**Flow:**
+1. Caller is marked as compromised via `POST /runtime-posture/compromise`
+2. Caller sends same valid JWT to Receiver
+3. Receiver validates JWT signature, issuer, audience, subject → **all pass**
+4. Receiver fetches caller's runtime posture → `compromised`
+5. Receiver denies access (403) and logs runtime-integrity failure
 
-### Runtime posture endpoints (demo-only)
-- GET  /runtime-posture — show current posture (`healthy` or `compromised`)
-- POST /runtime-posture/compromise — mark posture as `compromised`
-- POST /runtime-posture/recover — mark posture as `healthy`
+**Key Insight:** Identity pillar passes; runtime-integrity pillar fails → access denied.
 
-When posture is `compromised`, requests with otherwise valid identity receive 403 Forbidden and a runtime-integrity denial in the audit log.
+**Expected Evidence:**
+```json
+{"event":"authorization_decision","decision":"deny","reason":"runtime integrity compromised","caller_identity":"workload-caller-01","runtime_posture":"compromised"}
+```
 
-### Running locally (recommended)
-1. Create and activate a virtual environment (macOS/Linux):
+### Scenario 3: Explicit Recovery (Phase 2)
+
+**Setup:** Caller is compromised; access is being denied.
+
+**Flow:**
+1. Remediation occurs (e.g., service restart or security patch)
+2. Caller posture is explicitly set to `healthy` via `POST /runtime-posture/recover`
+3. Caller sends the same JWT to Receiver
+4. Receiver validates JWT and posture → both healthy
+5. Receiver grants access (200) and logs allow decision
+
+**Key Insight:** Recovery is explicit and requires re-evaluation; no automatic trust restoration.
+
+## Running the Proof of Concept
+
+### Prerequisites
+
+- Python 3.8+ (native architecture matching the system, especially on arm64 macOS)
+- For Docker Compose: Docker Engine or Docker Desktop
+
+### Local Execution (Recommended for Development)
+
+1. **Set up the environment:**
    ```bash
+   cd workload-identity-poc
    python3 -m venv .venv
    . .venv/bin/activate
    python -m pip install --upgrade pip
    python -m pip install -r requirements.txt
    ```
 
-   Notes:
-   - On Apple Silicon (arm64) macs, some binary wheels (e.g., pydantic_core) require matching interpreter architecture. If you see an ImportError referencing incompatible architecture, start servers using the same architecture as the wheel, e.g. `arch -arm64 .venv/bin/python -m uvicorn ...`.
-
-2. Start services for local testing (each command runs in its own terminal):
+   **Note on arm64 macOS:** Some binary wheels (e.g., `pydantic_core`) require architecture-matching Python. If you encounter ImportError about incompatible architecture, use:
    ```bash
-   .venv/bin/python -m uvicorn receiver.app.main:app --host 0.0.0.0 --port 8000
-   .venv/bin/python -m uvicorn caller.app.main:app   --host 0.0.0.0 --port 8001
+   arch -arm64 python3 -m venv .venv
    ```
 
-3. Run the demos:
-   - Valid request: `curl http://localhost:8001/demo-valid`
-   - Expired/invalid token: `curl http://localhost:8001/demo-invalid`
-   - Check posture: `curl http://localhost:8001/runtime-posture`
-   - Simulate compromise: `curl -X POST http://localhost:8001/runtime-posture/compromise`
-   - Recover: `curl -X POST http://localhost:8001/runtime-posture/recover`
+2. **Start the services** (each in a separate terminal):
+   ```bash
+   # Terminal 1: Receiver (protected resource)
+   .venv/bin/python -m uvicorn receiver.app.main:app --host 0.0.0.0 --port 8000
+   
+   # Terminal 2: Caller (workload identity provider)
+   .venv/bin/python -m uvicorn caller.app.main:app --host 0.0.0.0 --port 8001
+   ```
 
-### Running with Docker Compose
-1. Install Docker Desktop (macOS/Windows) or Docker Engine (Linux).
-2. From the repo root:
+3. **Run demonstrations:**
+
+   **Phase 1 — Baseline Trust:**
+   ```bash
+   # Valid token + healthy posture → 200 OK
+   curl http://localhost:8001/demo-valid
+   
+   # Expired token → 401 Unauthorized
+   curl http://localhost:8001/demo-invalid
+   ```
+
+   **Phase 2 — Compromise & Recovery:**
+   ```bash
+   # Check current posture
+   curl http://localhost:8001/runtime-posture
+   
+   # Simulate runtime compromise
+   curl -X POST http://localhost:8001/runtime-posture/compromise
+   
+   # Same valid token now denied → 403 Forbidden (runtime integrity compromised)
+   curl http://localhost:8001/demo-valid
+   
+   # Explicit recovery
+   curl -X POST http://localhost:8001/runtime-posture/recover
+   
+   # Access restored after recovery → 200 OK
+   curl http://localhost:8001/demo-valid
+   ```
+
+4. **Monitor audit logs:**
+
+   Watch the receiver service terminal to see structured JSON audit decisions.
+
+### Docker Compose Execution
+
+1. **Build and run:**
    ```bash
    docker compose up --build
    ```
-3. The same demo endpoints are exposed on the caller service port (8001). Use `docker compose logs -f` to follow audit output.
 
-### Tests
-- Unit/integration tests are provided under `tests/` and can be executed with the virtualenv active:
-  ```bash
-  python -m pytest -q
-  ```
-- CI should run the same command and ensure architecture/wheel compatibility in runner images.
+2. **Run the same demo commands** with HTTP hitting the exposed ports (8000, 8001).
+
+3. **Follow audit output:**
+   ```bash
+   docker compose logs -f receiver
+   ```
+
+### Testing
+
+Unit and integration tests validate all four trust flows (valid, expired, compromise, recovery):
+
+```bash
+. .venv/bin/activate
+python -m pytest -q
+```
+
+Expected result: **4 passed** (all trust scenarios verified).
 
 ### Troubleshooting
-- ImportError for `pydantic_core` complaining about incompatible architecture: recreate the venv on the target machine or run the Python binary under the same architecture as the wheel (macOS `arch` helper), or rebuild native wheels from source on that host.
-- If ports 8000/8001 are in use, stop the conflicting processes or change ports in the `uvicorn` commands and `docker-compose.yml`.
 
-### Expected audit evidence
-Healthy request example:
-```json
-{"event":"authorization_decision","decision":"allow","reason":"valid workload identity and healthy runtime posture","caller_identity":"workload-caller-01","runtime_posture":"healthy"}
-```
-Compromised request example:
-```json
-{"event":"authorization_decision","decision":"deny","reason":"runtime integrity compromised","caller_identity":"workload-caller-01","runtime_posture":"compromised"}
-```
+| Issue | Solution |
+|-------|----------|
+| `ImportError: pydantic_core (incompatible architecture)` | Recreate venv using matching Python architecture: `arch -arm64 python3 -m venv .venv` (macOS) or rebuild wheels on target system. |
+| Port 8000 or 8001 in use | Stop conflicting services or modify `uvicorn` commands and `docker-compose.yml` port mappings. |
+| Services don't start in Docker | Check Docker version; ensure sufficient disk space. |
 
-### Next steps (suggested)
-- Replace the posture toggle with signed remote attestations or a policy engine
-- Add time- and signal-based revocation windows and recovery proofs
-- Centralize audit logs and add tamper-evidence for compliance
+## What This POC Proves Today
+
+✅ **Authorization Depends on Multiple Trust Pillars**
+- A caller with valid identity but degraded runtime integrity is denied access
+- Identity and runtime-integrity failures are independently auditable
+
+✅ **Baseline JWT-Based Workload Identity**
+- Caller issues signed JWTs with subject, audience, and issuer claims
+- Receiver verifies JWT signature, issuer, audience, and subject on every request
+- Invalid or expired tokens are rejected with 401 Unauthorized
+
+✅ **Runtime Posture Observable in Access Control**
+- Receiver fetches caller's runtime posture before granting access
+- Healthy posture permits access; compromised posture triggers 403 Forbidden
+- Access decision is logged with decision reasoning and pillar details
+
+✅ **Explicit Recovery Semantics**
+- Recovery from compromised state is explicit, not automatic
+- A remediated caller must be explicitly recovered before access is restored
+- Recovery, like compromise, is logged as a state change
+
+✅ **Structured Audit Evidence**
+- All authorization decisions emit JSON records with:
+  - decision (allow/deny)
+  - reason (with pillar-level detail)
+  - caller_identity, runtime_posture, token_issuer, token_subject
+  - timestamp
+- Audit records distinguish identity failures from runtime-integrity failures
+
+## What Remains to Be Implemented
+
+❌ **Real Runtime Integrity Monitoring**
+- Compromise is simulated via API endpoint, not detected from actual system behavior
+- No real-time observation of memory, CPU, I/O, network, or system calls
+- No anomaly detection or behavioral analysis
+
+❌ **Other Trust Pillars**
+- Software Integrity: No SBOM attestation or code signing verification
+- Execution Integrity: No process metadata checks (UID, GID, capabilities, seccomp)
+- Operational Trust: No cryptographic audit-log protection or compliance framework
+
+❌ **Advanced Features**
+- No time-based trust windows or expiration
+- No signed remote attestations or policy engines
+- No cryptographic audit-log protection (tamper-evidence)
+- No central audit-log aggregation or retention
+- No machine-readable compliance reports
+
+❌ **Production Readiness**
+- Single-node, local-only architecture
+- No high-availability, replication, or fault tolerance
+- No rate limiting, request authentication beyond JWT, or defense-in-depth
+- No performance optimization or stress testing
+
+## Next Steps
+
+1. **Add Remote Attestation**
+   - Replace the posture-toggle API with signed attestations from a Trusted Execution Environment (TEE) or attestation service
+   - Require verification of attestation signature before accepting posture claims
+
+2. **Implement Real Monitoring**
+   - Integrate eBPF-based or seccomp-based monitoring to detect unauthorized system calls
+   - Add memory anomaly detection or code-integrity verification
+
+3. **Multi-Pillar Verification**
+   - Add process metadata verification (UID, GID, parent PID, seccomp status, capabilities)
+   - Implement SBOM verification and code-signing checks
+
+4. **Centralized Audit**
+   - Stream audit records to a centralized log sink (e.g., syslog, cloud audit log)
+   - Add cryptographic integrity protection (Merkle trees or signatures)
+   - Implement audit-log retention and search capabilities
+
+5. **Policy Engine**
+   - Define time-bound trust windows and recovery grace periods
+   - Make trust decisions configurable per workload, service pair, or environment
+   - Support graduated trust downgrades (deny, restrict, rate-limit, log-only)
 
 ---
 
-**Document Status:** Architecture Proposal + Phase 1 Implementation
-**Version:** 1.3
-**Date:** 2026
+**Document Status:** Architecture + Phase 1–2 Implementation + Demonstration  
+**Version:** 2.0  
+**Last Updated:** 2026-08-13
