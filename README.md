@@ -120,15 +120,32 @@ The proof of concept is successful if it demonstrates:
 - Trust decisions and audit records are logged centrally
 - The system continues operating during and after the compromise scenario
 
-## Phase 1 Implementation Status
+## Phase 2 Runtime Posture Trust Rule
 
-This repository now includes the Phase 1 baseline workload-identity proof of concept using Python, FastAPI, Docker Compose, and short-lived signed JWTs.
+This repository now implements the Phase 2 trust rule for the existing proof of concept.
 
-- `caller` sends a JWT to the protected receiver endpoint
-- `receiver` verifies signature, expiration, issuer, audience, and expected caller workload identity before allowing access
-- Every authorization decision emits a structured audit log with the caller identity, decision, and reason
-- The demonstration includes a valid request and a denied expired-token request
-- Runtime compromise detection, dynamic revocation, and recovery are intentionally not implemented in this phase
+Trust is granted only when both conditions are true:
+- the caller workload identity is valid, and
+- the caller runtime posture is `healthy`
+
+Access is denied when the workload identity remains valid but the runtime posture is `compromised`.
+
+### Runtime posture model
+- Default caller posture: `healthy`
+- Explicit safe simulation: `POST /runtime-posture/compromise` changes the posture to `compromised`
+- Explicit safe recovery: `POST /runtime-posture/recover` changes the posture back to `healthy`
+- No real exploit or evasion behavior is used; this is a local, minimal demonstration only
+
+### Audit semantics
+- Identity failure events are tagged as identity verification failures
+- Runtime-integrity failures are tagged separately as runtime integrity compromised
+- Recovery is explicit and recorded in logs as a change back to healthy posture
+
+## Repeatable Demonstration
+
+1. Valid identity + healthy posture: allowed
+2. Same valid identity after compromise: denied for runtime integrity
+3. Recovery to healthy posture: access restored only through explicit recovery
 
 ## Run Instructions
 
@@ -140,35 +157,62 @@ This repository now includes the Phase 1 baseline workload-identity proof of con
    python -m pip install --upgrade pip
    python -m pip install -r requirements.txt
    ```
-2. Run the services locally without Docker:
+2. Run the receiver and caller services locally:
    ```bash
    uvicorn receiver.app.main:app --host 0.0.0.0 --port 8000
    uvicorn caller.app.main:app --host 0.0.0.0 --port 8001
    ```
-3. Trigger the demonstration flows:
+3. Confirm the valid and expired-token Phase 1 demos still work:
    ```bash
    curl http://localhost:8001/demo-valid
    curl http://localhost:8001/demo-invalid
    ```
-4. Or run everything with Docker Compose:
+4. Demonstrate Phase 2 runtime compromise behavior:
+   ```bash
+   curl http://localhost:8001/runtime-posture
+   curl -X POST http://localhost:8001/runtime-posture/compromise
+   curl http://localhost:8001/demo-valid
+   ```
+   Expected result: the valid identity is denied with a 403 and reason `runtime integrity compromised`.
+5. Recover the workload posture explicitly and confirm access is restored:
+   ```bash
+   curl -X POST http://localhost:8001/runtime-posture/recover
+   curl http://localhost:8001/demo-valid
+   ```
+   Expected result: access is allowed again only after the explicit recovery action.
+6. Or run everything with Docker Compose:
    ```bash
    docker compose up --build
    curl http://localhost:8001/demo-valid
    curl http://localhost:8001/demo-invalid
+   curl -X POST http://localhost:8001/runtime-posture/compromise
+   curl http://localhost:8001/demo-valid
+   curl -X POST http://localhost:8001/runtime-posture/recover
+   curl http://localhost:8001/demo-valid
    ```
-5. Inspect the JSON audit logs emitted by the receiver service in the terminal output.
+7. Inspect the receiver terminal logs for JSON audit records showing `allow` and `deny` decisions with either identity-failure or runtime-integrity-failure reasons.
+
+## Expected Evidence
+
+A healthy request should produce a log entry resembling:
+```json
+{"event":"authorization_decision","decision":"allow","reason":"valid workload identity and healthy runtime posture","caller_identity":"workload-caller-01","runtime_posture":"healthy"}
+```
+
+A compromised request should produce a deny event resembling:
+```json
+{"event":"authorization_decision","decision":"deny","reason":"runtime integrity compromised","caller_identity":"workload-caller-01","runtime_posture":"compromised"}
+```
 
 ## Next Steps
 
-1. Define concrete runtime integrity signals and detection mechanisms
-2. Implement minimal Service A and Service B prototypes
-3. Develop runtime integrity monitoring and signaling
-4. Create a fault injection mechanism to simulate compromise
-5. Validate audit trail completeness and accuracy
-6. Document findings and recommendations for production implementations
+1. Add a separate policy store or signed posture attestation signal
+2. Introduce explicit trust state transitions and time-based evaluation windows
+3. Extend audit logging to centralize decisions for review and compliance
+4. Evaluate how this minimal model maps to real workload identity and attestation systems
 
 ---
 
-**Document Status:** Architecture Proposal + Phase 1 Implementation  
-**Version:** 1.1  
+**Document Status:** Architecture Proposal + Phase 2 Runtime Posture Control  
+**Version:** 1.2  
 **Date:** 2026
